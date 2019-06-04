@@ -1,0 +1,1277 @@
+---
+title: "Identifying the appropriate spatial resolution for the analysis of crime patterns"
+author: "Nick Malleson"
+date: '`r format(Sys.time(), "%d %B, %Y (%H:%M)")`'
+output:
+  html_document: 
+    toc: yes
+    pandoc_args: [
+      "+RTS", "-K64m",
+      "-RTS"
+    ]
+  pdf_document:
+    fig_crop: no
+    highlight: kate
+    keep_tex: yes
+    latex_engine: xelatex
+    number_sections: yes
+fontsize: 10pt
+---
+
+_This is the accompanying source code for the paper 'Identifying the appropriate spatial resolution for the analysis of crime patterns', in review for PlosOne_
+
+# Introduction
+
+The aim of the proposed method is to take two point-patterns, iteratively aggregate the points to cells of increasing size, and calculate the similarity between the two data sets at the different grid resoultions. See the right images for an example (from  [here](http://www.geog.leeds.ac.uk/courses/other/programming/practicals/general/modelling/validation/multiscale-code/2.html)).
+
+A similar method has has been used in the following paper:
+
+Malleson, N., A. Heppenstall, L. See, A. Evans (2013) Using an agent-based crime simulation to predict the effects of urban regeneration on individual household burglary risk. _Environment and Planning B: Planning and Design._ 40(3) 405-426. Available [here](http://www.envplan.com/abstract.cgi?id=b38057) and [here](http://nickmalleson.co.uk/wp-content/uploads/2013/05/EPB-V6-forBlog.pdf).
+
+## Thanks ... 
+
+... to Wouter Steenbeek for the `sppt` package that is used to calculate the similarity between two point patterns.
+
+... to Lex Comber and Chris Brunsdon for their excellent book 'R for Spatial Analysis and Mapping' which was invaluable for most of the R GIS techniques.
+
+Brunsdon, C and Comber, L (2015) _An Introduction to R for Spatial Anaysis and Mapping_. Sage
+
+## Configuration and library loading
+
+Configure the script here. As well as making sure all the libraries used below have been installed, you need to:
+
+ 1. Set your working directory (the `WORKING_DIR` variable below) to be the location of this script.
+ 
+ 1. (Optionally) configure the three parameters (`N`, `N.SHIFTS`, `STEP`).
+ 
+ 1. Install the `sppt` package from its source on GitHub. See [https://github.com/wsteenbeek/sppt](https://github.com/wsteenbeek/sppt) for install instructions, but these basically boil down to: ```devtools::install_github("wsteenbeek/sppt", force = TRUE)```
+
+```{r initialise}
+
+# This directory needs to be set to the location of this script
+WORKING_DIR <- '~/mapping/projects/sppt/for_msea_paper'
+setwd(WORKING_DIR)
+
+# These three parameters control the algorithm. The easiest way to generate some results relatively quickly
+# is to reduce the number of shifts (N.SHIFTS) or to increase the step (STEP).
+N <- 50        # The number of iterations
+N.SHIFTS <- 10 # The number of times the grid is shifted randomly at each iteration
+STEP <- 1      # The size of increments as the algorithm iterates between 1 and N.
+
+# XXXX FIX THIS - IT HAS BEEN REDUCED FOR TESTING
+STEP <- 1      # The size of increments as the algorithm iterates between 1 and N.
+
+library(GISTools)  # Loads of good GIS functions
+library(rgdal)     # For reading shapefiles
+library(raster)    # For creating regular grids
+library(tmap)      # For thematic maps
+library(OpenStreetMap) # For OSM basemap to thematic maps
+library(classInt) # Jenks natural breaks
+library(xtable)   # For making latex/html tables
+library(hydroGOF)   # Has an rmse() function
+library(parallel) # For ruonning things in parallel (e.g. mclapply())
+library(pbapply)  # For progress bar in parallel
+no_cores <- ceiling(detectCores() / 3)  # Detect the number of cores that are available, but don't use all as the more that are used the more memory is required and it can become huge.
+Sys.setenv(MC_CORES=no_cores) # Run on n cores (I'm not sure which of these
+options("mc.cores"=no_cores)  # is correct).
+library(ggplot2)  # For graphs
+library(gridExtra) # For arranging two grids side by side
+library(statmod)
+library(spatstat)  # For doing KDE maps and simulating point patterns
+library(maptools)  # ditto
+
+# The spatial point pattern test library. See https://github.com/wsteenbeek/sppt for install instructions.
+# devtools::install_github("wsteenbeek/sppt", force = TRUE)
+library(sppt) 
+```
+ 
+# Data
+
+## Crime data
+
+### Read crime data 
+
+We use publicly-available Vancouver crime data, available [here](http://data.vancouver.ca/datacatalogue/crime-data.htm).
+
+Data are available from: [http://data.vancouver.ca/datacatalogue/crime-data-details.htm](http://data.vancouver.ca/datacatalogue/crime-data-details.htm) and there is a single zip file: [ftp://webftp.vancouver.ca/opendata/shape/crime_shp_all_years.zip](ftp://webftp.vancouver.ca/opendata/shape/crime_shp_all_years.zip).
+
+The script begins by downloading the data (if necessary).
+
+```{r downloadData }
+ZIPFILENAME <- "crime_shp_all_years.zip"
+
+if (!file.exists(ZIPFILENAME)) {
+  print("Downloading crime data")
+  download.file(url = "ftp://webftp.vancouver.ca/opendata/shape/crime_shp_all_years.zip", destfile = ZIPFILENAME)
+}
+
+```
+
+Then read it in:
+
+```{r readData}
+
+# Unzip the files into the working directory
+zipfile <- unzip(ZIPFILENAME)
+
+# Read the shapefile
+all.crime <- readOGR(dsn="./crime_shp_all_years", layer = "crime_shp_all_years")
+
+# Delete the extracted file
+unlink(zipfile)
+unlink("crime_shp_all_years", recursive = TRUE) # a left over directory
+
+# Assign short codes to crime types (the below throws an error about 'values must be length 1'
+# if there are any crime types that aren't matched to short equivalents)
+all.crime$TYPE2 <- as.factor(unlist(
+  mclapply(X = all.crime$TYPE, FUN = function(t) {
+    t2 <- switch(as.character(t),
+          "Break and Enter Commercial" = "BNEC", 
+          "Break and Enter Residential/Other" = "BNER",
+          "Mischief" = "MISCHIEF",
+          "Other Theft" = "OTHERTHEFT",
+          "Theft from Vehicle" = "TFV",
+          "Theft of Bicycle" = "TOB",
+          "Theft of Vehicle" = "TOV",
+          "Vehicle Collision or Pedestrian Struck (with Fatality)" = "COLFAT", 
+          "Vehicle Collision or Pedestrian Struck (with Injury)" = "COLINJ")
+})))
+  
+# Drop 2018 (not sufficient data yet)
+all.crime <- all.crime[which(all.crime$YEAR<2018),]
+
+rm(ZIPFILENAME)
+```
+
+### Crime data: descriptive statistics
+
+How many different crimes are there, by year:
+
+```{r allCrimeByYear-table, results="asis" }
+print(xtable(table(all.crime$TYPE, all.crime$YEAR)), type="html")
+```
+
+Do a graph as well, indexed to volume at the start
+
+```{r allCrimeByYear-graph, fig.width=9, fig.height=6 }
+
+crime.table <- table(all.crime$TYPE, all.crime$YEAR)
+crime.types <- rownames(crime.table)
+crime.years <- sapply(X = colnames(crime.table), FUN = strtoi)
+
+
+for ( i in 1:length(crime.types)) {
+  type <- crime.types[i]
+  
+  # Need to index
+  start <- crime.table[type,1]
+  yval <- 100 * ( crime.table[type,] / start)
+  if (i==1) {
+    plot(x=crime.years, y=yval, type='o', lty=1, pch=i, col=i, ylim=c(0,250),
+         main="Change in crime volumes over time", ylab="Number of crimes (indexed)", xlab="Year"
+         )
+  }
+  lines(x=crime.years, y=yval, type='o', lty=1, pch=i, col=i)
+  legend("topleft", legend = crime.types, col=1:length(crime.types), lty=1, pch=1:length(crime.types), cex=0.7)
+}
+
+
+rm(start, yval, type, crime.table, crime.types, crime.years)
+```
+
+For context, see how many there are in total (using short names of crimes)
+
+```{r allCrime-totals_graph, fig.width=7, fig.height=4 }
+barplot(rowSums(table(all.crime$TYPE2, all.crime$YEAR)
+), horiz=TRUE, cex.names=0.8, las=1)
+```
+
+### Subset crime data 
+
+Split the big file up into different crimes
+
+```{r subsetRawData }
+# A directory for the crime data (in case it doesn't exist)
+dir.create(file.path("./ROUT", "crime"), showWarnings = FALSE)
+
+# Shorter versions of the crime types
+crime.types2 <- unique(all.crime$TYPE2)
+
+for (type in crime.types2) {
+  assign(as.character(type), all.crime[all.crime$TYPE2==type,])
+  # Optionally write them as well as they can be useful later. 
+  #writeOGR(all.crime[all.crime$TYPE2==type,], dsn = "./", layer = type, 
+  #         driver = "ESRI Shapefile", overwrite_layer = TRUE)
+}
+
+rm(crime.types2)
+```
+
+## Areas data
+
+Finally we need some administrative boundaries. In the analysis we want to mask cells that aren't over land as these will distort the results. These boundaries are also useful in displaying the results.
+
+
+```{r readBondariesData }
+vancouver.boundaries <- readOGR(dsn="./vancouver_boundaries", layer = "areas")
+```
+
+
+## Exploratory Maps
+
+It is useful to do some maps of the crime data for later.
+(From [https://mgimond.github.io/Spatial/point-pattern-analysis-in-r.html](https://mgimond.github.io/Spatial/point-pattern-analysis-in-r.html)).
+
+### KDE maps of crime in 2015 and 2016
+
+This produces the maps for Figure 2 without the legend. I add the lengend manually afterwards as the density itself is arbitrary. To include the legends in the maps replace the `ribbon = FALSE` argument with `ribbon = TRUE`.
+
+```{r kde-all, fig.width=9, fig.height=10}
+
+# From this point we start to create images for the paper. Create the required directory.
+dir.create("./figs_for_paper", showWarnings = FALSE)
+
+BANDWIDTH = 300
+
+# Do kernel density for all crime types in 2015 and 2016. Build up a list with all the required info so that I can loop
+kdes <- list()
+counter <- 1
+for (d in c(TFV, TOB, BNER, BNEC)) {
+  for (year in c(2015,2016)) {
+    kde <- stats::density(as(d[d$YEAR==year,], "ppp"), sigma=BANDWIDTH)
+    kdes[[counter]] <- list(
+      "name" = d$TYPE2[1], # TYPE2 column stores the name (e.g. 'BNER'), so just take the first row
+      "year" = year,
+      "kde"  = kde,
+      "shading" = auto.shading(kde, n=9, cols = brewer.pal(8, "Blues"))
+    )
+    counter <- counter + 1
+  } # for year
+} # for crime type
+
+do.plot <- function() {
+  par(mfrow=c(4,2))
+  # Reduce the size of the margins temporarily
+  margins <- par("mar")
+  par(mar=c(1.0,1.0,1.0,1.0)) # bottom, left, top, right
+  for (x in kdes) {
+    plot(vancouver.boundaries, main=paste(x$name, x$year))
+    plot(x$kde, col=x$shading$cols, ribbon = FALSE, bty="n", add=T) # calls plot.im
+    plot(vancouver.boundaries, add=T)
+  }
+  par(mar=margins)
+}
+do.plot()
+
+
+pdf(file = "figs_for_paper/crime_kde.pdf", width=9, height=10)
+do.plot()
+dev.off()
+
+rm(d, counter, year, kde)
+```
+
+
+# The Multi-Scale Error Assessment Method (MSEA)
+
+The method works as follows:
+
+ 1. Aggregate the points to a regular grid
+ 2. Calculate the S-Index (local and global) (as well as some other statistics)
+ 3. Shift the grids multiple times in N, E, S, W in order to reduce the impact of MAUP and calculate S-Index again
+ 4. Increase the resolution of the grid, and repeat
+  
+The following defines a function that will run the method.
+
+```{r defineMSEA}
+
+#' Multi-Scale Error Assessment (MSEA).
+#'
+#' Run the Multi-Scale Error Assessment (MSEA) method, returning the difference between two point data sets at different geographical scales using different measures of error
+#' 
+#' @param points1 A set of points (a SpatialPointsDataFrame, or SpatialPoints object)
+#' @param points2 The set of points to compare against (another SpatialPointsDataFrame or SpatialPoints object)
+#' @param N The number of times to sub-divide the largest cell. I.e. if N=20 then the smallest grid at which 
+#'    error is calculated will be 20*20 cells. Note: the algorithm starts at i=2 which gives 2*2=4 cells as 
+#'    the most coarse resolution (doesn't make sense to calculate error for 1 data point)
+#' @param n.shifts The number of times to shift the grid at each resolution
+#' @param mask An optional SpatialPolygons* that contains the areas we are interested in. Any cells that do not intersect
+#'   one of these areas will be excluded.
+#' @param ignore.zeros Whether to remove cells with no crimes in them (the abundance of zeros at higher resolutions can distort the statistics)
+#' @param step The number of steps in between two resolutions before re-calculating the grid. Default 1, i.e. 
+#'    every sub-division between 1 and N will be calculated. If \code{step} were \code{2}, then only every
+#'    other grid resolution will actually be computed.
+#' @param return.sobject Whether to return the object that is created by sppt. Default true. Setting
+#'    to false can reduce the size of the results
+#' @param return.grids Whether to return the actual grids (spatial objects).  Default true. Setting
+#'    to false can reduce the size of the results
+#' @param run.parallel Whether to run across multiple cores (default TRUE)
+#' @param The specific sppt function to run, i.e. one of `sppt` (default), `sppt_boot`, or `sppt_diff`
+#' @param ... Other arguments passed to the various sppt functions
+#'
+#' @return An list that encapsulates the results of the test as well as some other useful information:
+#' 
+#'  \code{results} - a list of the individual grids computed for each cell size. This will have length N. Each item in the list is a SpatialPolygonsDataFrame with the following attributes:
+#'  \itemize{
+#'  \item{"CellID"}{A unique numerical ID for each cell in the grid}
+#'  \item{"points1"}{The number of points from the points1 dataset that fall within the cell}
+#'  \item{"points2"}{The number of points from the points2 dataset that fall within the cell}
+#'  \item{"p1.pct"}{The percentage of points from the points1 dataset that fall within the cell}
+#'  \item{"p2.pct"}{The percentage of points from the points1 dataset that fall within the cell}
+#'  \item{"diff"}{The difference in the number of points (points1 - points2)}
+#'  \item{"abs.diff"}{The absolute difference in the number of points}
+#'  \item{"abs.pct.diff"}{The absolute difference in the percentages (nice to map)}
+#'  \item{"localS"}{Andresen's Local S Index}
+#'  \item{"localS.robust"}{Robust version of Andresen's Local S Index (ignores areas with no points)}
+#'  \item{"similarity"}{The similarity (like S but just highlights difference, not direction)}
+#'  \item{"similarity.robust"}{Robust version of \code{similarity}}
+#'  \item{"ConfLowP"}{The lower confidence limit for the S Index}
+#'  \item{"ConfUppP"}{The upper confidence limit for the S Index}
+#' }
+#'   Note that if \code{return.grids} is false then this isn't returned
+#'
+#'  \code{cell.areas} - A vector (length N) with the square area of a cell in each grid
+#'
+#'  \code{num.cells} - A vector (length N) with the number of cells in each grid
+#'
+#'  \code{rss} - a vector of length N with the residual sum of squares error value for each grid
+#'
+#'  \code{r.squared} - a vector of length N with the R-Squared error for each grid
+#'
+#'  \code{rmse} - a vector of length N with the Root Mean Square Error value for each grid
+#'
+#'  \code{globalS} - a vector of length N with Andresen's Global S index
+#'
+#'  \code{globalS.robust} - a vector of length N with the robust version of Andresen's Global S index that 
+#'    ignores areas with no points (note that if \code{ignore.zeros} is \code[TRUE] then this is the
+#'    same as the \code{globalS})
+#'
+#'  \code{mean.similarity} - a vector of length N with the mean similarity (areas with 1 are similar, 0
+#'     dissimilar). This is only available when sppt_func = sppt_diff and will be NA otherwise
+#' 
+#'  \code{mean.similarity.robust} - a vector of length N with the mean similarity (areas with 1 are similar, 0
+#'     dissimilar). This is only available when sppt_func = sppt_diff and will be NA otherwise
+#' 
+#'  \code{iteration} - a vector of length N with the iteration number that this grid is part of
+#' 
+#'  \code{shift} - a vector of length N with the shift number of this grid (e.g. one of 1--10 if there
+#'    are ten shifts per iteration).
+#'
+#'
+#'  \code{s.object} - a vector of length N with the object returned by the call to \code{sppt} (used to 
+#'    calculate the S Index). This can be useful for debugging etc, but is probably unnecessary as 
+#'    all of the useful global and local information returned from \code{sppt} have been included directly.
+#'    Note that if `return.sobject` is FALSE then this isn't returned.
+#'
+#' @examples
+#' rmse(points1, points2)
+msea <- function(points1, points2, N=20, n.shifts = 10, mask=NULL, ignore.zeros=FALSE, step=1, 
+                 return.sobject=TRUE, return.grids=TRUE, run.parallel=TRUE,
+                 sppt_func = sppt, ... ) {
+  
+  # Check that the projections are the same or NA (in that case make a warning)
+  if ( is.na(proj4string(points1)) | is.na(proj4string(points2))) {
+    warning("Either points1 or points2 have NA projections. Continuing anyway\n")
+  } else if ( proj4string(points1) != proj4string(points2) ) {
+    warning("The points1 and points2 projections are different, this will probably lead to catastrophic results!\n")
+    stop()
+  }
+    
+  bb <- bbox(points1 + points1) # A bounding box around all points
+  
+  # Run each resolution in parallel. The output is a named list with all of the different elements in it
+  # resolutions is a list of all resolutions to run at
+  run.resolution <- function(resolutions) {
+    parallel.output <- list()
+  
+    # Store all grids (data frames) in a big long list
+    parallel.output[["results"]] <- list()
+    
+    # Remember some other things that are useful later
+    parallel.output[["cell.areas"]] <- c() # The area of the cells
+    parallel.output[["num.cells"]] <- c()  # The number of cells in each iteration
+  
+    # Remember the global errors associated with each grid
+    parallel.output[["rss"]] <- c() # Residual sum of squares
+    parallel.output[["r.squared"]] <- c()
+    parallel.output[["rmse"]] <- c()
+    parallel.output[["globalS"]] <- c()
+    parallel.output[["globalS.robust"]] <- c()
+    parallel.output[["mean.similarity"]] <- c()
+    parallel.output[["mean.similarity.robust"]] <- c()
+    
+    # Keep a link to the object that is returned from the call to sppt. Useful for debugging mostly.
+    parallel.output[["s.object"]] <- c()
+    
+    # Remember the iteration and shift numbers (these are the i and j in the nested loops)
+    parallel.output[["iteration"]] <- c()
+    parallel.output[["shift"]] <- c()
+    
+    # Create the grids - adapted from Brunsdon & Comber (2015, p150)
+    # Note: will actually start at i=2 which gives 2*2=4 cells (doesn't make sense to calculate error for 1 data point)
+    # but it's easier to start from i=1 and delete that result afterwards
+    for (i in resolutions) {
+      # Cell size is the total width divided by the number of cells to draw so far (i)
+      cell.width <-  (bb[1,2] - bb[1,1]) / i
+      cell.height <- (bb[2,2] - bb[2,1]) / i
+      
+      # Make the bounding box slightly larger than necessary (by half a cell in each direction), 
+      # so when the grid is shifted there wont be any points outside
+      # It needs to be big enough so that it can have one extra ring of cells around it
+      bb.larger <- bb # The new bounding box
+      #bb.larger["coords.x1","min"] <- bb["coords.x1","min"] - ( cell.width / 2  ) # Min x gets smaller
+      #bb.larger["coords.x2","min"] <- bb["coords.x2","min"] - ( cell.height / 2 ) # Min y gets smaller
+      #bb.larger["coords.x1","max"] <- bb["coords.x1","max"] + ( cell.width / 2  ) # Max x gets larger
+      #bb.larger["coords.x2","max"] <- bb["coords.x2","max"] + ( cell.height / 2 ) # Max y gets larger
+      bb.larger[1,"min"] <- bb[1,"min"] - ( cell.width / 2  ) # Min x gets smaller
+      bb.larger[2,"min"] <- bb[2,"min"] - ( cell.height / 2 ) # Min y gets smaller
+      bb.larger[1,"max"] <- bb[1,"max"] + ( cell.width / 2  ) # Max x gets larger
+      bb.larger[2,"max"] <- bb[2,"max"] + ( cell.height / 2 ) # Max y gets larger
+      
+      # For each resolution, repeat a few times by slightly shifting the grid by a random amount in a random direction
+      for (j in 1:n.shifts) {
+        # Remember the cell area (useful later) (needs to be repeated for each shift)
+        parallel.output[["cell.areas"]] <- c(parallel.output[["cell.areas"]], (cell.width * cell.height) )
+  
+        # Chose random N-S and E-W directions to shift the grid in (using a random uniform distribution)
+        shift.x <- runif(n=1, min=-cell.width /2, max=cell.width /2 )
+        shift.y <- runif(n=1, min=-cell.height/2, max=cell.height/2)
+        
+        # Calculate the centre of the lower-left cell (the one with the smallest coordinates),
+        # taking into account the shift
+        centre.x <- bb.larger[1,1] + ( cell.width  / 2 ) + shift.x
+        centre.y <- bb.larger[2,1] + ( cell.height / 2 ) + shift.y
+        
+        # Create a grid  
+        grd <- GridTopology(
+          cellcentre.offset = c(centre.x, centre.y), # No offset, the grid will just cover all the points
+          cellsize = c(cell.width, cell.height),
+          cells.dim = c(i+1,i+1)
+        )
+        
+        number.of.cells <- (i+1) * (i+1) # Add an extra row and column to account for shifting 
+        # Remember the number of cells in this iteration:
+        parallel.output[["num.cells"]] <- c(parallel.output[["num.cells"]], number.of.cells) 
+        
+        # Convert the grid into a SpatialPolygonsDataFrame
+        spdf <- SpatialPolygonsDataFrame(
+          as.SpatialPolygons.GridTopology(grd),
+          data = data.frame(c(1:number.of.cells)),
+          match.ID = FALSE
+        )
+        proj4string(spdf) <- proj4string(points1)
+        names(spdf) <- "CellID" # Name the column
+        
+        # Remove any cells that don't intersect the mask?
+        if (!is.null(mask)) {
+          #browser()
+          # Join spdf to the mask. Returns rows for all spdf, which will be NA if there was no join
+          a <- over(spdf, mask)
+          # Check some cells overlap, otherwise something has almost certainly gone wrong. (Doesn't matter
+          # which field we check so just do first; a[1])
+          stopifnot(length(which(!is.na(a[1]))  ) > 0 )
+          # Remove those that have NA for the first column (could have chosen any)
+          spdf <- spdf[which(!is.na(a[1])),]
+          rm(a)
+        }
+        
+        # Aggregate the points
+        spdf@data$points1 <- poly.counts(points1, spdf)
+        spdf@data$points2 <- poly.counts(points2, spdf)
+        
+        # Drop cells with 0 for both counts?
+        if (ignore.zeros) {
+          spdf <- spdf[which(spdf@data$points1>0 | spdf@data$points2>0),]
+          stopifnot( length(which(spdf@data$points1==0 & spdf@data$points2==0)) == 0 )
+        }
+        
+        # Calculate percentages of points in each area (might be useful)
+        spdf@data$p1.pct <- 100 * spdf@data$points1 / sum(spdf@data$points1 )
+        spdf@data$p2.pct <- 100 * spdf@data$points2 / sum(spdf@data$points2 )
+        
+        # Calculate the errors 
+        
+        # Difference in the number of points
+        spdf@data$diff <- spdf@data$points1 - spdf@data$points2
+        
+        # Absolute difference
+        spdf@data$abs.diff <- abs(spdf@data$points1 - spdf@data$points2)
+        
+        # Absolute Difference in percentages
+        spdf@data$abs.pct.diff <- abs(spdf@data$p1.pct - spdf@data$p2.pct)
+        
+        # The Local S Index (slightly more convoluted)
+        s <- sppt_func(points1, points2, spdf, ... ) # Calculate the index
+        
+        # Sanity check - check the sppt package calculates the same percentages as this code
+        stopifnot( identical(s$CELLID,spdf$CELLID) ) # Check the cells are in the same order (avoids having to merge on cell ID)
+        
+        # Useful Stats. associated with the S Index 
+        # (the whole S object is also returned later too, but these are more convenient to have direct access to)
+        spdf@data$localS            <- s@data$localS
+        spdf@data$localS.robust     <- s@data$localS.robust
+        spdf@data$similarity.robust <- s@data$similarity.robust
+        spdf@data$ConfLowP          <- s@data$ConfLowP
+        spdf@data$ConfUppP          <- s@data$ConfUppP
+        spdf@data$similarity        <- s@data$similarity
+        spdf@data$similarity.robust <- s@data$similarity.robust
+        
+        # Optionally store this result by appending it to the end of the list of results that we have so far
+        if (return.grids) {
+          parallel.output[["results"]][[ length(parallel.output[["results"]]) + 1 ]] <- spdf
+        } else {
+          parallel.output[["results"]][[ length(parallel.output[["results"]]) + 1 ]] <- NA
+        }
+        
+        # Now calculte the global errors
+       
+        # RSS 
+        parallel.output[["rss"]] <- c(parallel.output[["rss"]], sum( ( spdf@data$points1 - spdf@data$points2 )**2 ))
+        # R squared
+        parallel.output[["r.squared"]] <- c(parallel.output[["r.squared"]], 
+                                            summary(lm(spdf@data$points1 ~ spdf@data$points2, data=spdf@data))$r.squared )
+        # RMSE
+        parallel.output[["rmse"]] <- c(parallel.output[["rmse"]], rmse(spdf@data$points1, spdf@data$points2) )
+
+        # Global S Index (normal and robust). In globalS, each area has same value for global S, so take 1st row
+        # arbitrarily. For robust version, need to find the first row that isn't NA (hence use min()).
+        parallel.output[["globalS"]] <- c(parallel.output[["globalS"]], s@data[1,"globalS"]        ) 
+        parallel.output[["globalS.robust"]] <- c(parallel.output[["globalS.robust"]],
+                                                 s@data[min(which(!is.na(s@data$globalS.robust))),"globalS.robust"] )
+        
+        # Mean Similarity. Areas are either similar (1) or dissimilar (0). Take the mean.
+        # This is only possible using the newer sppt functions like sppt_diff
+        if ( isTRUE(all.equal(sppt_func, sppt_diff))) { # Check using sppt_diff
+          parallel.output[["mean.similarity"]]        <- c(parallel.output[["mean.similarity"]],        mean( ( spdf@data$similarity) ) )
+          parallel.output[["mean.similarity.robust"]] <- c(parallel.output[["mean.similarity.robust"]], mean( ( spdf@data$similarity.robust) ) )
+        } else {
+          parallel.output[["mean.similarity"]] <-        c(parallel.output[["mean.similarity"]], NA)
+          parallel.output[["mean.similarity.robust"]] <- c(parallel.output[["mean.similarity.robust"]], NA)
+        }
+        
+        
+        # Optionally sometimes useful to keep a reference to the raw results returned by the sppt call (mostly for debugging)
+        if (return.sobject) {
+          parallel.output[["s.object"]] <- c(parallel.output[["s.object"]], s)
+        } else {
+          parallel.output[["s.object"]] <- c(parallel.output[["s.object"]], NA)
+        }
+        
+        # Also useful to know which iteration number and grid shift this is (useful for naming grids)
+        parallel.output[["iteration"]] <- c(parallel.output[["iteration"]], i)
+        parallel.output[["shift"]] <- c(parallel.output[["shift"]], j)
+  
+        # Try to reduce memory footprint
+        spdf <- NULL
+        gc() 
+        
+      } # for shifting grids
+      
+    } # for cell sizes
+  
+    return(parallel.output)
+    
+  } # run.resolution function
+  
+  iterations <- seq(from=1,to=N,by=step)
+  pout <- if (run.parallel) mclapply(X=iterations, FUN= run.resolution ) else lapply(X=iterations, FUN= run.resolution )
+  
+  # Now we have a big list with all of the results and other useful information in it.
+  # The pout list has one item for each resolution. Extract the separate parts into their
+  # own variables to make it easier to see what's going on. The code below is extra
+  # confusing because sapply returns a matrix (resolutions are rows, shifts are columns (or
+  # the other way round)) so c() is needed to vectorise the matrix.
+  results <-                c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["results"]] ))
+  num.cells <-              c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["num.cells"]] ))
+  cell.areas <-             c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["cell.areas"]] ))
+  rss <-                    c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["rss"]] ))
+  r.squared <-              c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["r.squared"]] ))
+  rmse <-                   c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["rmse"]] ))
+  globalS <-                c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["globalS"]] ))
+  globalS.robust <-         c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["globalS.robust"]] ))
+  mean.similarity        <- c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["mean.similarity"]] ))
+  mean.similarity.robust <- c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["mean.similarity.robust"]] ))
+  s.object <-               c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["s.object"]] ))
+  iteration <-              c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["iteration"]] ))
+  shift <-                  c(sapply(X=1:length(pout), FUN=function(x) pout[[x]][["shift"]] ))
+  
+  # Delete the results that used one single large cell as these don't mean anything
+  results[[1]] <- NULL
+  num.cells <-      num.cells      [2:length(num.cells)]
+  cell.areas <-     cell.areas     [2:length(cell.areas)]
+  rss <-            rss            [2:length(rss)]
+  r.squared <-      r.squared      [2:length(r.squared)]
+  rmse <-           rmse           [2:length(rmse)]
+  globalS <-        globalS        [2:length(globalS)]
+  globalS.robust <- globalS.robust [2:length(globalS.robust)]
+  mean.similarity <-mean.similarity[2:length( mean.similarity)]
+  mean.similarity.robust <-mean.similarity[2:length( mean.similarity.robust)]
+  s.object <-       s.object       [2:length(s.object)]
+  iteration <-      iteration      [2:length(iteration)]
+  shift <-          shift          [2:length(shift)]
+  
+  # Sanity check - global errors and other info should be vectors of the same length
+  stopifnot(
+    length(num.cells) == length(cell.areas) &
+    length(num.cells) == length(rss) &
+    length(num.cells) == length(r.squared) &
+    length(num.cells) == length(rmse) & 
+    length(num.cells) == length(globalS) & 
+    length(num.cells) == length(globalS.robust) &
+    length(num.cells) == length(mean.similarity) &
+    length(num.cells) == length(mean.similarity.robust) &
+    length(num.cells) == length(s.object) &
+    length(num.cells) == length(iteration) &
+    length(num.cells) == length(shift)
+  )
+
+  # Return the results
+  r <- list(
+    "results" = results,
+    "cell.areas" =cell.areas,
+    "num.cells" = num.cells,
+    "rss" = rss,
+    "r.squared" = r.squared,
+    "rmse" = rmse,
+    "globalS" = globalS,
+    "globalS.robust" = globalS.robust,
+    "mean.similarity" = mean.similarity,
+    "mean.similarity.robust" = mean.similarity.robust,
+    "s.object" = if (return.sobject) s.object else NA,
+    "iteration" = iteration,
+    "shift" = shift
+  )
+  return(r)
+  
+} # function
+  
+```
+
+
+
+# Results
+
+## Run the MSEA
+
+Run the MSEA algorithm on BNER, BNEC, TFV and TOB, comparing 2015 and 2016.
+
+**IMPORTANT:** Depending on the number of iterations (`N`), number of grid shifts (`N.SHIFTS`) and the step size (`STEP`) (all of which were defined at the top of the script) this can take a very long time (hours at least). The `run.parallel` argument speeds this up by running the algorithm on numerous cores simultaneously, but this dramatically increases the amount of memory R will use (for each core used, the amount of memory doubles).
+
+```{r runMSEA-all, cache=TRUE }
+
+# Put the data into lists so I don't have to do too much repeating
+
+# Original experiments using 2015 and 2016
+data1 <- list("base" = BNER[BNER$YEAR==2015,], "test"= BNER[BNER$YEAR==2016,], name="BNER")
+data2 <- list("base" = BNEC[BNEC$YEAR==2015,], "test"= BNEC[BNEC$YEAR==2016,], name="BNEC")
+data3 <- list("base" = TFV[TFV$YEAR==2015,],   "test"= TFV[TFV$YEAR==2016,],   name="TFV")
+data4 <- list("base" = TOB[TOB$YEAR==2015,],   "test"= TOB[TOB$YEAR==2016,],   name="TOB")
+
+# Put all together into one main list
+all.diff <- list(data1, data2, data3, data4)
+
+rm(data1, data2, data3, data4)
+
+# Use the sppt_diff (difference in proportions) version of the function
+tmp <- lapply(X = all.diff, FUN = function(x) { 
+  msea(x[['base']], x[['test']], N=N, n.shifts=N.SHIFTS, mask=vancouver.boundaries, run.parallel = TRUE,
+       ignore.zeros = F, step=STEP, return.sobject=TRUE, return.grids=TRUE,
+       sppt_func = sppt_diff, adj = "none", test="Fisher" # (note additional argument to sppt_diff)
+  ) })
+stopifnot(length(tmp)==4)
+# Store the results in the lists in an item called 'r'
+for (i in 1:length(tmp)) {
+  all.diff[[i]][['r']] <- tmp[[i]]
+}
+rm(tmp)
+gc() # Do some garbage collection after deleting the big temporary objects (maybe not necessary)
+
+```
+
+
+
+## Decide which iterations to map
+
+Later, six maps of varying resolutions will be produced. Vertical lines that reflect each of these six resolutions will be drawn on the charts to show what the resolution is like in the context of the study area (i.e. how large a cell is relative to roads, buildings, etc.).
+
+```{r IterationsToMap}
+# Decide on which grids to map. Choose 6 spread evenly throughout all of the possible grids
+ITERATIONS.TO.MAP <- c(13, 18, 23, 28, 40,  50)
+
+# Work out a grid index associated with each of these iterations.
+grids.to.map <- sapply(X=ITERATIONS.TO.MAP, FUN=function(x) {
+  return(min(which(all.diff[[1]]$r$iteration - x >= 0))) })
+
+print(ITERATIONS.TO.MAP)
+print(grids.to.map)
+```
+
+
+
+
+## Analysis of Expected Frequency
+
+Estimate whether there are a sufficient number of points in an area (cell) to warrant performing a similarity calculation: estimate the _expected frequency_. Then disregard areas that have insufficient expected frequency.
+
+Proceed as follows:
+
+  1. Conduct a test to see if the proportaions of crime in t1 and t2 are similar or different as usual (e.g. Fisher exact test as per `sppt_diff`)
+  
+  2. Calculate the _expected frequency_ of each area as:
+    - row marginal total / column marginal total * grand total
+    - Note that the column marginal total of the dataset with the _fewer_ crimes should be used; this makes it more conservative.
+    
+    3. A rule of thumb for a Chi-squared test is that each cell should have at count of at least 5. Therefore disregard all statistical results (from (1)) that have an expected frequency < 5
+    
+    4. As with the power analysis, go on to look at how the expected frequency changes with the number of cells and do some maps.
+
+
+```{r expectedFrequencyAnalysis}
+
+EXPECTED <- 5 # Set the minimum number of expected points
+
+# Takes the output from sppt and adds a new column for the expected frequency 
+expected.frequency.calc <- function(s) {
+  
+  # Need the column marginal with the fewest crimes to be conservative
+  col.marginal <- if ( sum(s$points1) < sum(s$points2)) sum(s$points1) else sum(s$points2)
+  
+  # Total number of events in total
+  grand.total <- sum(s$points1) + sum(s$points2)
+  
+  # Join together points1 and points2
+  bind <- cbind(s$points1, s$points2)
+  
+  # Now calculate expected as row_marginal * col_marginal / grand_total
+  s$expected <- unlist(lapply( X = 1:nrow(s), FUN = function(x) {
+    row.marginal <- bind[x,1] + bind[x,2] # (points1 + points2)
+    return( row.marginal * col.marginal / grand.total )
+  } ) )
+  return(s)
+}
+
+# Now do the calculation. This needs nested loops. 
+# - The first loop (i) iterates over the different crime types
+# - The second loop (j) iterates over every grid for that crime type
+
+for (i in 1:length(all.diff)) { # For each crime type
+  
+  # First check that the s.objects were actually saved This isn't always done (to save memory)
+  if(TRUE %in% is.na(all.diff[[i]]$r$s.object)) {
+    stop("One of the s.objects is NA, which means it probably wasn't returned when the MSEA function was run itially. 
+         You need to use the argument 'return.sobject=TRUE' in msea()")
+  }
+  
+  num.grids <- length(all.diff[[i]]$r$cell.areas) # The total number of grids calculted
+  
+  # Go through each s.object and replace it with one that has the expected frequency column added
+  for (j in 1:num.grids) {
+    all.diff[[i]]$r$s.object[[j]] <- expected.frequency.calc(all.diff[[i]]$r$s.object[[j]])
+  }
+  
+}
+
+```
+
+### Look at how expected frequency changes with number of cells
+
+Graph the mean number expected value across all cells per iteration.  _Note that this doesn't say anything about the distribution of the expected values - this might remain fairly stable for crime types that are highly concentrated_.
+
+```{r expectedFrequecy-meanPowerChange, fig.width=11, fig.height=7}
+
+do.plot <- function() {
+  
+par(mfrow=c(2,2))
+for (crime.type in 1:4) {
+  
+  n.cells <- all.diff[[crime.type]]$r[["num.cells"]]
+  grids <- all.diff[[crime.type]]$r$s.object # need the output s objects to get the expected value
+  # Get the mean power of each iteration:
+  mean.expected <- sapply(X = grids, FUN=function(x) { mean(x@data[,"expected"])} ) 
+  median.expected <- sapply(X = grids, FUN=function(x) { median(x@data[,"expected"])} ) 
+  
+  plot(x=n.cells, y=mean.expected, ylab="Average expected number of crimes", ylim=c(0,50), col="black", pch="o", cex=0.8,
+       main=paste("Average expected value at\neach resolution - ",all.diff[[crime.type]]$name), xlab="Number of Cells in the Grid" )
+  points(x=n.cells, y=median.expected,col="black", pch="+")
+  abline(h=EXPECTED, col="red",lty="dashed")
+  
+  # Add lines showing which iterations I'm happing (for context)
+    for (i in grids.to.map) {
+      # Need to calculate the number of cells in each of the grids as these are what the x axis snows
+      num.cells <- all.diff[[crime.type]]$r$num.cells[i]
+      cell.size <- round(all.diff[[crime.type]]$r[["cell.areas"]][i]/10000 ) 
+      abline(v = num.cells, lty="dashed")
+      text  (x = num.cells, y=45, cex=0.6, labels=paste0("Cells\n",num.cells,"\n\nha\n",cell.size) )
+    }
+  
+  #legend("topright",legend=c("Mean", "Median"), col=c("black", "black"), pch=c("o","+"))
+  legend(x = 1950, y=50, legend=c("Mean", "Median"), col=c("black", "black"), pch=c("o","+"))
+}
+}
+
+# For knitr
+do.plot()
+
+# For the paper
+pdf(file = "figs_for_paper/average_expected_value.pdf", width=11, height=7)
+do.plot()
+dev.off()
+```
+
+See what the proportion of cells with sufficient expected frequency looks like for the different crimes types.
+
+```{r expectedFrequecy-meanProportionChange, fig.width=11, fig.height=7}
+
+do.plot <- function() {
+  par(mfrow=c(2,2))
+  for (crime.type in 1:4) {
+    
+    n.cells <- all.diff[[crime.type]]$r[["num.cells"]]
+    grids <- all.diff[[crime.type]]$r$s.object # need the output s objects to get the expected value
+    ratio <- sapply(X = grids, FUN=function(x) {
+      length(which(x@data[,"expected"] >= EXPECTED)) / length(x@data[,"expected"])
+       } ) 
+  
+    plot(x=n.cells, y=ratio, 
+         main=paste("Proportion of cells with\nexpected >",EXPECTED,"at each iteration - ", all.diff[[crime.type]]$name),
+         xlab="Number of Cells in the Grid", ylab="Proportion", ylim=c(0,1))
+    #abline(h=EXPECTED, col="red",lty="dashed")
+    # Add lines showing which iterations I'm happing (for context)
+    for (i in grids.to.map) {
+      # Need to calculate the number of cells in each of the grids as these are what the x axis snows
+      num.cells <- all.diff[[crime.type]]$r$num.cells[i]
+      cell.size <- round(all.diff[[crime.type]]$r[["cell.areas"]][i]/10000 ) 
+      abline(v = num.cells, lty="dashed")
+      text  (x = num.cells, y=0.9, cex=0.6, labels=paste0("Cells\n",num.cells,"\n\nha\n",cell.size) )
+    }
+  }
+}
+
+# for knitr
+do.plot()
+
+# For the paper
+pdf(file = "figs_for_paper/proportion_expected_value.pdf", width=11, height=7)
+do.plot()
+dev.off()
+
+```
+
+And what about the raw numbers of cells. This is possibly useful because it gives us an idea about how much information we're using to determine similarity, but can be misleading because it ignores the fact that the total number of cells increases with resolution, so the number with expected > 5 increases as well.
+
+```{r expectedFrequecy-numCellsChange, fig.height=7, fig.width=9}
+
+par(mfrow=c(2,2))
+for (crime.type in 1:4) {
+  n.cells <- all.diff[[crime.type]]$r[["num.cells"]]
+  grids <- all.diff[[crime.type]]$r$s.object # need the output s objects to get the expected value
+  num <- sapply(X = grids, FUN=function(x) { length(which(x@data[,"expected"] >= EXPECTED ))} ) 
+
+  plot(x=n.cells, y=num, 
+       main=paste("Number of cells with\nexpected >",EXPECTED,"at each iteration - ", all.diff[[crime.type]]$name),
+       xlab="Number of Cells", ylab="Frequency")
+  #abline(h=EXPECTED, col="red",lty="dashed")
+}
+rm(n.cells, grids, num)
+```
+
+
+
+## Map similarity after Expected Frequency Analysis
+
+Look at the similarity, taking expected frequncy into account
+   - make all spatial units that have fewer than 5 expected units are 'lightgrey' (#D3D3D3)
+   - color the other spatial units as normal
+
+   
+```{r expectedFrequencyAnalysis-MapsOfSimilarity, fig.width=9, fig.height=11}
+
+statistic <- "similarity" # (note 'similarity' rather than 'mean.similarity' because we're looking at the similarity on a cell-level, not mean of the whole grid)
+
+do.plot <- function() {
+  
+  par(mfrow=c(4,3), # Assuming six iterations to map, for two crime types
+      mar=c(1, 2, 2, 1) + 0.1 # Smaller margins around the individual plots ( c(bottom, left, top, right) )
+  ) 
+  options(scipen=10)
+  for (crime.type in c(1,4)) { # BNER and TOB
+    for (index in grids.to.map) {
+      num.cells <- all.diff[[crime.type]]$r[["num.cells"]][index]
+      sq.area <- all.diff[[crime.type]]$r[["cell.areas"]][index] / 10000 # hectares
+      grid <- all.diff[[crime.type]]$r$s.object[[index]]
+      if(!isS4(grid)) stop("The grid is NA (or at least not S4), which probably means that you didn't return the grids when 
+                           the msea() function was called originally (you need 'return.grids=TRUE'")
+      
+      # Prepare the colours. Use light grey if the expected value is too small
+      cols<- sapply( X=1:nrow(grid@data), FUN = function(i) {
+        expected <- grid@data[i,"expected"]
+        sim <- grid@data[i,statistic]
+        if (expected < EXPECTED) return("#D3D3D3") # insufficient expected number of crimes
+        if (sim==0) return("#d8b365") # not similar
+        if (sim==1) return("#5ab4ac") # similar
+        return ("#FF0000") # an error
+      } )
+        
+      # Plot the grid
+      plot(grid, main=paste0("Local ", statistic," (",all.diff[[crime.type]]$name,")"), lty=0, col=cols)
+      # Add boundaries
+      plot(vancouver.boundaries, lwd=0.5, lty='dashed', add=T)
+      # Legend
+      legend("topleft", cex=0.7, legend=c(paste0("Undefined (<",EXPECTED," expected)"),
+                                 "Dissimilar (0)","Similar (1)"), fill=c("#D3D3D3", "#d8b365", "#5ab4ac") )
+      
+      text(x=grid@bbox["x", "min"]*1.005, y=grid@bbox["y", "min"]*1.0001, cex=0.7,
+           labels = paste0("Num Cells: ",num.cells, "\nSquare Area (ha): " ,round(sq.area,digits = 1)))
+    } # for grid
+  } # for crime type
+} # function
+
+# For knirt
+do.plot()
+
+# For the maper
+pdf(file = "figs_for_paper/similarity_map.pdf", width=9, height=11)
+do.plot()
+dev.off()
+```
+
+
+
+## Graph mean similarity (ignoring those with insufficient expected frequencies)
+
+Graph mean similarity (as before) but excluding cells that do not have a sufficient expected frequency.
+
+First calculate a new statistic `mean.similarity.excluding.low.ef` that NAs any cells with an expected frequency < 5 and then recalculates the mean similarity
+
+```{r expectedFrequencyAnalysis-recalcMeanSimilarity }
+
+# Now do the calculation. This needs nested loops. 
+# - The first loop (i) iterates over the different crime types
+# - The second loop (j) iterates over every grid for that crime type
+
+# NOTE: 
+# all.diff[[i]]$r - the 'results' object that needs to hold the mean.similarity.excluding.low.ef
+# all.diff[[i]]$r$mean.similarity[j] - the mean similarity of grid j (calculated initially in msea())
+# all.diff[[i]]$r$s.object[[j]] - the underlying s object used to calculate the mean similarity etc.
+# all.diff[[i]]$r$s.object[[j]]$expected  - gives the expected frequency of every cell in the grid j of crime type i
+
+for (i in 1:length(all.diff)) { # For each crime type
+  
+  # First check that the s.objects were actually saved This isn't always done (to save memory)
+  if(TRUE %in% is.na(all.diff[[i]]$r$s.object)) {
+    stop("One of the s.objects is NA, which means it probably wasn't returned when the MSEA function was run itially. 
+         You need to use the argument 'return.sobject=TRUE' in msea()")
+  }
+  
+  num.grids <- length(all.diff[[i]]$r$cell.areas) # The total number of grids calculted
+  mean.similarities <- c() #ia vertor holding the mean similarity (excluding low expected frequency) of each grid
+  
+  # For each grid
+  for (j in 1:num.grids) {
+    ef <- all.diff[[i]]$r$s.object[[j]]$expected # Vector of expected frequencies
+    # Calculate the mean similarity, disregarding those with < 5 frequency
+    mean.similarities[j] <- mean(all.diff[[i]]$r$s.object[[j]]$similarity[which(ef>=EXPECTED)])
+  }
+  
+  # Should be one calculation for each iteration
+  stopifnot(length(all.diff[[i]]$r$cell.areas) == length(mean.similarities))
+  
+  # Append new similarity to the results
+  all.diff[[i]]$r$mean.similarity.excluding.low.ef <- mean.similarities
+  
+}
+
+rm( mean.similarities, num.grids, ef)
+```
+
+Now produce the graphs of mean similarity, excluding those with insufficient expected frequency.
+
+```{r expectedFrequencyAnalysis-ecca_graphs-withci, fig.width=11, fig.height=7, warning=FALSE, message=FALSE }
+
+# ITERATIONS.TO.MAP shows  the iteraitons that I am aiming for  (defined earlier)
+# grids.to.map shows the grids that match these iterations (one of the many at that particular iteration anyway)
+
+# Make some lists so that the same plotting code can loop
+crime.types = vapply(X=all.diff, FUN=function(x)x$name, FUN.VALUE = character(1)) # The crime types (4)
+
+# Make some lists so that the same plotting code can loop 
+colours  <- brewer.pal(4, "Set2") # Colours for the points and lines
+
+s.type = "mean.similarity.excluding.low.ef" # Note that this is only calculated when using sppt_diff
+
+plots = list()
+
+for (i in 1:length(crime.types)) { # For each crime type
+  crime.type <- crime.types[i]
+  r <- all.diff[[i]]$r # This is the results of the test for the crime type
+  x <- r[["num.cells"]] 
+  y <- r[[s.type]] # The S Index (either normal or robust)
+  df = data.frame("NumCells"=r[["num.cells"]], "NewSimilarity"=r[[s.type]] )
+  
+  plots[[i]] <- ggplot(df, aes(NumCells, NewSimilarity)) +
+    geom_hex(bins=20, show.legend = FALSE) +
+    scale_fill_gradientn(colours=c("white","red"),name = "Frequency")+
+    #geom_point(size=0.5, color=colours[i]) +
+    geom_point(size=0.8, color='black') + 
+    geom_smooth(method="loess", se=TRUE, level=0.99, colour="black")+
+    ggtitle(paste0("Mean Similarity - ",crime.type,"\n(Excluding cells with low expected frequency)"))+
+    ylab("Mean Similatiry")+
+    xlab("Number of Cells in the Grid")+
+    ylim(0.5,1)
+  # Add horizontal lines showing which resolutions are being mapped
+  for (j in grids.to.map) {
+    num.cells <- all.diff[[1]]$r$num.cells[j]
+    cell.size <- round(all.diff[[1]]$r[["cell.areas"]][j]/10000 ) 
+    plots[[i]] <-  plots[[i]] + 
+      geom_vline(xintercept=num.cells, color="black", linetype="dotted")+
+      annotate("text", x=num.cells, y=0.6, size=2.5,
+               label= paste0("Cells:\n",num.cells,"\n\nha:\n",cell.size) )
+  }
+  # Add verticle lines showing the approximate square areas of DAs (10ha) and CTs (100ha)
+  # (horrible indexing, as need to find the index of the square area nearest 10 and 100, then index on num.cells)
+  dt.index <- all.diff[[1]]$r$num.cells[ which.min(abs(all.diff[[1]]$r[["cell.areas"]]/10000 - 10 )) ]
+  ct.index <- all.diff[[1]]$r$num.cells[ which.min(abs(all.diff[[1]]$r[["cell.areas"]]/10000 - 100)) ]
+  plots[[i]] <-  plots[[i]] + 
+    geom_vline(xintercept=dt.index, color="blue", linetype="dotted")+
+    annotate("text", x=dt.index, y=0.97, size=3.5, label = "Dissemination area\n(~10ha)", colour="blue" ) +
+    geom_vline(xintercept=ct.index, color="blue", linetype="dotted")+
+    annotate("text", x=ct.index, y=0.97, size=3.5, label = "Census Tract\n(~100ha)",       colour="blue" )
+
+}
+
+p <- grid.arrange(plots[[1]],plots[[2]],plots[[3]], plots[[4]], nrow=2, ncol=2)
+
+ggsave(filename="figs_for_paper/similarity_graph.pdf", plot=p)
+
+rm(p, dt.index, ct.index)
+
+```
+
+# Run Simulations
+
+Look at how the MSEA algorithm behaves under simulations of point patterns
+
+## Create simulation data
+
+Begin by creating some simulated data. 
+
+```{r createSimulatedData, fig.width=11, fig.height=7 }
+
+# Create five random point patterns with increasingly different parameters.
+p1.ppp <- rpoispp(function(x,y) {8000 * exp(-1*x) * exp(-1*y)}, win=owin(c(0,1),c(0,1)) )
+p2.ppp <- rpoispp(function(x,y) {8000 * exp(-1*x) * exp(-1*y)}, win=owin(c(0,1),c(0,1)) )
+p3.ppp <- rpoispp(function(x,y) {12000 * exp(-1.5*x) * exp(-1.5*y)}, win=owin(c(0,1),c(0,1)) )
+p4.ppp <- rpoispp(function(x,y) {17000 * exp(-2*x) * exp(-2*y)}, win=owin(c(0,1),c(0,1)) )
+p5.ppp <- rpoispp(function(x,y) {32000 * exp(-3*x) * exp(-3*y)}, win=owin(c(0,1),c(0,1)) )
+
+
+# Plot them. stats::density actually gives an 'im' object, so plot.im is used
+sigma <- bw.diggle(p1.ppp) # Use the same bandwitdh
+ZLIM.max <- max(stats::density(p1.ppp,sigma), stats::density(p2.ppp,sigma), 
+                stats::density(p3.ppp,sigma), stats::density(p4.ppp,sigma), stats::density(p5.ppp,sigma))
+ZLIM.min <- min(stats::density(p1.ppp,sigma), stats::density(p2.ppp,sigma),
+                stats::density(p3.ppp,sigma), stats::density(p4.ppp,sigma), stats::density(p5.ppp,sigma))
+#cols <- interp.colourmap( colourmap(c("yellow", "orange", "red"), range=c(ZLIM.min, ZLIM.max)) )  # use the same colours
+cols <- colourmap(brewer.pal(9, "YlOrRd"), range=c(ZLIM.min, ZLIM.max))  # use the same colours
+
+do.plot <- function() {
+  
+par(mfrow=c(2,3))
+plot(stats::density(p1.ppp), sigma, col=cols, axes=TRUE, main="Simulated Points 1")
+points(p1.ppp, pch='.', cex=2.0)
+plot(stats::density(p2.ppp) ,sigma, col=cols, axes=TRUE, main="Simulated Points 2")
+points(p2.ppp, pch='.', cex=2.0)
+plot(stats::density(p3.ppp), sigma, col=cols, axes=TRUE, main="Simulated Points 3")
+points(p3.ppp, pch='.', cex=2.0)
+plot(stats::density(p4.ppp), sigma, col=cols, axes=TRUE, main="Simulated Points 4")
+points(p4.ppp, pch='.', cex=2.0)
+plot(stats::density(p5.ppp), sigma, col=cols, axes=TRUE, main="Simulated Points 5")
+points(p5.ppp, pch='.', cex=2.0)
+}
+
+do.plot()
+pdf(file = "figs_for_paper/sim_density.pdf", width=11, height=7)
+do.plot()
+dev.off()
+
+# Convert the 'ppp' classes to SpatialPoints
+p1 <- as.SpatialPoints.ppp(p1.ppp)
+p2 <- as.SpatialPoints.ppp(p2.ppp)
+p3 <- as.SpatialPoints.ppp(p3.ppp)
+p4 <- as.SpatialPoints.ppp(p4.ppp)
+p5 <- as.SpatialPoints.ppp(p5.ppp)
+
+rm(p1.ppp, p2.ppp, p3.ppp, p4.ppp, p5.ppp, ZLIM.min, ZLIM.max, cols)
+```
+
+## Run the MSEA algorithm on these data
+
+Run the algorithm: (_Note: chunk caching doesn't work for some reason so the script saves these simulated results to an `RData` file. This file needs to be deleted manually for the simulation to be re-run_).
+
+```{r simulateMSEA}
+# Rmd chunk caching doesn't work for some reason, so manually save the results of the analysis.
+SIMULATED.RESULTS.FILE <- "simulated_results_cache.RData"
+
+if (file.exists(SIMULATED.RESULTS.FILE)) {
+  print("Loading simulated results from file")
+  load(SIMULATED.RESULTS.FILE)
+} else {
+  print("Running simulation")
+    
+  # Put the data into lists so I don't have to do too much repeating
+  # (Excuse the strange list structure, this is so that it matches axactly the list structure used with the real data)
+  sim.diff <- list(
+    list("base" = p1, "test"= p2, name="SIM2"),
+    list("base" = p1, "test"= p3, name="SIM3"),
+    list("base" = p1, "test"= p4, name="SIM4"),
+    list("base" = p1, "test"= p5, name="SIM5")
+    )
+  
+  gc()
+  # Use the sppt_diff (difference in proportions) version of the function
+  tmp <- lapply(X = sim.diff, FUN = function(x) { 
+    msea(x[['base']], x[['test']], N=N, n.shifts=N.SHIFTS,# mask=vancouver.boundaries,
+         ignore.zeros = F, step=STEP, return.sobject=TRUE, return.grids=TRUE, run.parallel = TRUE, 
+         sppt_func = sppt_diff, adj = "none", test="Fisher" # (note additional argument to sppt_diff)
+    ) })
+  stopifnot(length(tmp)==4)
+  # Store the results in the lists in an item called 'r'
+  for (i in 1:length(tmp)) {
+    sim.diff[[i]][['r']] <- tmp[[i]]
+  }
+  rm(tmp)
+  gc() # Do some garbage collection after deleting the big temporary objects (maybe not necessary)
+  save(sim.diff, file = SIMULATED.RESULTS.FILE)
+}
+```
+
+
+Also do the expected frequency analysis. First calculate the expected frequency, the re-calculate similarity after excluing low frequency cells.
+
+```{r sim-expectedFrequency}
+
+# Calculate the expected frequency
+
+# Go through each s.object and replace it with one that has the expected frequency column added
+for (i in 1:length(sim.diff)) { # For each crime type
+    num.grids <- length(sim.diff[[i]]$r$cell.areas) # The total number of grids calculted
+
+  # Go through each s.object and replace it with one that has the expected frequency column added
+  for (j in 1:num.grids) {
+    sim.diff[[i]]$r$s.object[[j]] <- expected.frequency.calc(sim.diff[[i]]$r$s.object[[j]])
+  }
+
+  # Now calculate similarity after removing the cells with insufficient expected
+  mean.similarities <- c() #ia vertor holding the mean similarity (excluding low expected frequency) of each grid
+  
+  # For each grid
+  for (j in 1:num.grids) {
+    ef <- sim.diff[[i]]$r$s.object[[j]]$expected # Vector of expected frequencies
+    stopifnot(length(sim.diff[[i]]$r$s.object[[j]]$similarity)==length(ef)) # Sanity check
+    # Calculate the mean similarity, disregarding those with < 5 frequency
+    mean.similarities[j] <- mean(sim.diff[[i]]$r$s.object[[j]]$similarity[which(ef>=EXPECTED)])
+  }
+  
+  
+  # Should be one calculation for each iteration
+  stopifnot(length(sim.diff[[i]]$r$cell.areas) == length(mean.similarities))
+  
+  # Append new similarity to the results
+  sim.diff[[i]]$r$mean.similarity.excluding.low.ef <- mean.similarities
+}
+
+rm( mean.similarities, num.grids, ef)
+```
+
+
+## Results of the simulation - Expected frequency in simulated data
+
+See what the proportion of cells with sufficient expected frequency looks like for the simulations
+
+```{r sim-expectedFrequecy-meanProportionChange, fig.width=11, fig.height=7}
+
+do.plot <- function() {
+  par(mfrow=c(2,2))
+  for (crime.type in 1:4) {
+    n.cells <- sim.diff[[crime.type]]$r[["num.cells"]]
+    grids <-   sim.diff[[crime.type]]$r$s.object # need the output s objects to get the expected value
+    ratio <- sapply(X = grids, FUN=function(x) {
+      length(which(x@data[,"expected"] >= EXPECTED)) / length(x@data[,"expected"])
+       } ) 
+  
+    plot(x=n.cells, y=ratio, 
+         main=paste("Proportion of cells with\nexpected >",EXPECTED,"at each iteration - ", sim.diff[[crime.type]]$name),
+         xlab="Number of Cells in the Grid", ylab="Proportion", ylim=c(0,1))
+  }
+}
+
+# for knitr
+do.plot()
+
+```
+
+## Results of the simulation - Graphs of similarity change
+
+Graphs that show how the similarity changes.
+
+```{r sim-ecca_graphs-withci, fig.width=11, fig.height=7, warning=FALSE, message=FALSE }
+
+# Make some lists so that the same plotting code can loop 
+colours  <- brewer.pal(4, "Set2") # Colours for the points and lines
+
+s.type = "mean.similarity.excluding.low.ef" # Note that this is only calculated when using sppt_diff
+
+sim.types <- sapply(X=sim.diff, FUN=function(x) {x[['name']] }) # For labelling the different simulations
+
+plots = list()
+
+for (i in 1:length(sim.diff)) { # For each crime type
+  sim.type <- sim.types[i]
+  r <- sim.diff[[i]]$r # This is the results of the test for the crime type
+  x <- r[["num.cells"]] 
+  y <- r[[s.type]] # The S Index (either normal or robust)
+  df = data.frame("NumCells"=r[["num.cells"]], "NewSimilarity"=r[[s.type]] )
+  
+
+  plots[[i]] <- ggplot(df, aes(NumCells, NewSimilarity))
+  # Only do the hex bins on SIM2,3,4 (it looks bad for the test that has identical points)
+  if (i>0) {
+    plots[[i]] <- plots[[i]] + geom_hex(bins=20, show.legend = FALSE) +
+    scale_fill_gradientn(colours=c("white","red"),name = "Frequency")
+  }
+  plots[[i]] <- plots[[i]] +
+    geom_point(size=0.8, color='black') + 
+    geom_smooth(method="loess", se=TRUE, level=0.99, colour="black")+
+    ggtitle(paste0("Mean Similarity - ",sim.type,"\n(Excluding cells with low expected frequency)"))+
+    ylab("Mean Similatiry")+
+    xlab("Number of Cells in the Grid")+
+    ylim(0.5,1)
+  
+
+}
+
+#plots[[1]]
+p <- grid.arrange(plots[[1]],plots[[2]],plots[[3]], plots[[4]], nrow=2, ncol=2)
+
+ggsave(filename="figs_for_paper/similarity_graph-sim.pdf", plot=p)
+
+rm(p, dt.index, ct.index, r, x, y, df)
+
+```
+
+
+# Other
+
+See if there were any warnings:
+
+```{r warnings }
+warnings()
+```
+
+Save all this as an image that can be read in again later (prevents having to re-do lenghy simulations etc.).
+
+```{r save.results, warning=FALSE }
+# All of the R objects. Makes it easy to re-read the results
+save.image("multi_scale_error_analysis.RData")
+```
+

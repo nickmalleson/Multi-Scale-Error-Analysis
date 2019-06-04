@@ -1,0 +1,1 @@
+Rscript -e "require(knitr) ; require(markdown) ; knit('multi_scale_error_analysis.Rmd', 'multi_scale_error_analysis.md');  markdownToHTML('multi_scale_error_analysis.md', 'multi_scale_error_analysis.html');"
